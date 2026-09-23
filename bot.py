@@ -2,8 +2,8 @@
 """
 Germany News -> Threads autoposter
 
-Парсит RSS-ленты политических новостей Германии, отбирает только новости по теме,
-через Claude пишет короткий пост на русском и публикует его в Threads
+Собирает свежие новости Германии из крупных СМИ, через Claude выбирает самую
+резонансную и обсуждаемую, пишет цепляющий пост на русском и публикует его в Threads
 через официальный Threads API. Запускается по расписанию в GitHub Actions.
 """
 
@@ -15,6 +15,7 @@ import random
 import hashlib
 import logging
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 import feedparser
 import requests
@@ -29,24 +30,29 @@ log = logging.getLogger("germany-threads-bot")
 THREADS_ACCESS_TOKEN = os.environ["THREADS_ACCESS_TOKEN"].strip()
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"].strip()
 
-MAX_POSTS_PER_RUN = int(os.environ.get("MAX_POSTS_PER_RUN", "1"))
-MAX_CLAUDE_CHECKS_PER_RUN = int(os.environ.get("MAX_CLAUDE_CHECKS_PER_RUN", "6"))
-MIN_INTERVAL_MINUTES = int(os.environ.get("MIN_INTERVAL_MINUTES", "60"))
-MAX_INTERVAL_MINUTES = int(os.environ.get("MAX_INTERVAL_MINUTES", "150"))
+MIN_INTERVAL_MINUTES = int(os.environ.get("MIN_INTERVAL_MINUTES", "90"))
+MAX_INTERVAL_MINUTES = int(os.environ.get("MAX_INTERVAL_MINUTES", "180"))
+MIN_SCORE = int(os.environ.get("MIN_SCORE", "7"))          # порог «вирусности» 1-10
+POST_HOURS = (7, 23)                                         # публикуем только с 7:00 до 23:00 по Германии
+MAX_CANDIDATES_TO_SCORE = 40
 STATE_FILE = os.environ.get("STATE_FILE", "state/seen.json")
 
 THREADS_API = "https://graph.threads.net/v1.0"
 THREADS_TEXT_LIMIT = 500
 
+# Общие ленты крупных СМИ: политика, общество, деньги, скандалы, происшествия, звёзды
 RSS_SOURCES = [
-    {"name": "ARD Tagesschau - Inland", "url": "https://www.tagesschau.de/inland/index~rss2.xml"},
-    {"name": "Deutschlandfunk - Politik", "url": "https://www.deutschlandfunk.de/politikportal-100.rss"},
-    {"name": "ZDF - Politik", "url": "https://www.zdf.de/rss/zdf/nachrichten/politik"},
-    {"name": "Süddeutsche Zeitung - Politik", "url": "https://rss.sueddeutsche.de/rss/Politik"},
+    {"name": "Tagesschau", "url": "https://www.tagesschau.de/index~rss2.xml"},
+    {"name": "Spiegel", "url": "https://www.spiegel.de/schlagzeilen/index.rss"},
+    {"name": "n-tv", "url": "https://www.n-tv.de/rss"},
+    {"name": "Welt", "url": "https://www.welt.de/feeds/latest.rss"},
+    {"name": "Focus", "url": "https://rss.focus.de/fol/XML/rss_folnews.xml"},
+    {"name": "t-online", "url": "https://www.t-online.de/feed.rss"},
+    {"name": "Süddeutsche Zeitung", "url": "https://rss.sueddeutsche.de/rss/Topthemen"},
 ]
 
-# Дешёвый предварительный отсев по ссылке/заголовку (до вызова Claude)
-BLOCK_WORDS = ["/sport/", "/wetter/", "fussball", "fußball", "bundesliga", "tatort", "lotto"]
+# Явно скучное — отсекаем сразу, до вызова Claude
+BLOCK_WORDS = ["/wetter/", "lotto", "horoskop", "gewinnspiel", "rezept", "liveblog", "live-ticker", "newsblog"]
 
 anthropic_client = Anthropic(api_key=ANTHROPIC_API_KEY)
 
@@ -67,8 +73,8 @@ def load_state() -> dict:
 
 def save_state(state: dict) -> None:
     os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
-    state["seen_hashes"] = state["seen_hashes"][-500:]
-    state["seen_links"] = state["seen_links"][-500:]
+    state["seen_hashes"] = state["seen_hashes"][-800:]
+    state["seen_links"] = state["seen_links"][-800:]
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
 
@@ -127,8 +133,9 @@ def fetch_candidates(state: dict) -> list:
         if feed.bozo and not feed.entries:
             log.warning(f"Лента {source['name']} вернула ошибку без записей, пропускаю")
             continue
+        log.info(f"{source['name']}: {len(feed.entries)} записей")
 
-        for entry in feed.entries[:10]:
+        for entry in feed.entries[:15]:
             link = entry.get("link", "")
             title = entry.get("title", "").strip()
             summary = strip_html(entry.get("summary", "") or entry.get("description", ""))[:800]
@@ -163,30 +170,66 @@ def fetch_candidates(state: dict) -> list:
 # ---------------------------------------------------------------------------
 # Claude
 # ---------------------------------------------------------------------------
+def pick_best(candidates: list):
+    """Одним запросом просит Claude оценить резонансность заголовков и вернуть лучший."""
+    batch = candidates[:MAX_CANDIDATES_TO_SCORE]
+    lines = "\n".join(f"{i}. [{c['source']}] {c['title']}" for i, c in enumerate(batch))
+    prompt = f"""Ты редактор вирусного русскоязычного аккаунта в Threads о жизни в Германии.
+Аудитория — русскоязычные, которые живут в Германии или интересуются ею.
+
+Оцени каждую новость по шкале 1-10: насколько она вызовет эмоции, споры и репосты у этой аудитории.
+Высокие оценки: скандалы, возмущение, неожиданные решения властей, деньги (налоги, пособия,
+Bürgergeld, пенсии, штрафы, цены, аренда), миграция и документы, громкие происшествия,
+абсурдные истории из немецкой жизни, скандалы со знаменитостями и политиками, всё, что «касается каждого».
+Низкие оценки: сухая протокольная политика, мелкие региональные события, спортивные результаты,
+культура без скандала, иностранные новости без связи с Германией.
+
+Ответь ТОЛЬКО JSON без пояснений: {{"scores": {{"0": 5, "1": 8, ...}}}}
+
+Новости:
+{lines}"""
+    try:
+        response = anthropic_client.messages.create(
+            model="claude-sonnet-5",
+            max_tokens=800,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = "".join(b.text for b in response.content if hasattr(b, "text"))
+        raw = raw[raw.find("{"): raw.rfind("}") + 1]
+        scores = {int(k): int(v) for k, v in json.loads(raw)["scores"].items()}
+        scores = {k: v for k, v in scores.items() if 0 <= k < len(batch)}
+    except Exception as e:
+        log.error(f"Не удалось получить оценки от Claude: {e}")
+        return None, {}
+    best = max(scores, key=scores.get, default=None)
+    return best, scores
+
+
 def write_post(title: str, summary: str, source_name: str):
-    prompt = f"""Ты ведёшь личный аккаунт в Threads: человек из Германии коротко и понятно рассказывает
-русскоязычной аудитории о главных политических новостях страны.
+    prompt = f"""Ты ведёшь личный аккаунт в Threads: человек, который живёт в Германии,
+рассказывает русскоязычной аудитории самые обсуждаемые новости страны. Задача — чтобы пост
+остановил скролл и под ним начали спорить в комментариях.
 
-СНАЧАЛА реши, подходит ли новость аккаунту.
-Публикуем ТОЛЬКО: внутреннюю и внешнюю политику Германии, федеральное правительство и министров,
-Бундестаг и Бундесрат, земельные парламенты и правительства, партии, выборы, законы и реформы,
-миграцию и убежище, бюджет, налоги и экономическую политику, оборону и Бундесвер,
-позицию и участие Германии в ЕС, НАТО и мировой политике.
-НЕ публикуем: спорт, погоду, криминал, ДТП, пожары и происшествия без политического значения,
-культуру, кино, музыку, шоу-бизнес, лайфстайл, здоровье и науку без политического решения,
-новости других стран, если в них нет прямой связи с Германией или её политикой.
-Если новость НЕ подходит — ответь ровно одним словом: SKIP
-
-Если подходит — напиши пост для Threads на русском языке:
-- первая строка — короткий цепляющий заголовок с одним эмодзи по теме (без markdown, без звёздочек)
-- затем 2-3 коротких предложения по существу, нейтрально и понятно для тех, кто не живёт в Германии
+Напиши пост на русском:
+- первая строка — сильный крючок с одним эмодзи: самое удивительное, возмутительное или
+  неожиданное в этой новости (без markdown, без звёздочек, без КАПСА целыми словами)
+- затем 1-2 коротких предложения: что произошло и почему это касается людей
+- последняя строка — короткий вопрос к аудитории, на который хочется ответить
+- живой разговорный тон, как пишет человек, а не агентство
 - строго не длиннее 450 символов вместе с пробелами
 - без хэштегов, ссылок, названия источника и подписи
-- только текст поста, без пояснений
+
+Жёсткие правила:
+- только факты из новости ниже; не выдумывай детали, цифры и цитаты, не преувеличивай
+- не называй имён частных лиц — пострадавших и подозреваемых
+- не разжигай ненависть к народам, религиям и другим группам людей
+Если новость нельзя подать без нарушения этих правил — ответь одним словом: SKIP
 
 Новость на немецком (источник: {source_name}):
 Заголовок: {title}
-Описание: {summary}"""
+Описание: {summary}
+
+Ответь только текстом поста."""
 
     try:
         response = anthropic_client.messages.create(
@@ -293,6 +336,11 @@ def main():
     log.info("Запуск Germany Threads Bot")
     state = load_state()
 
+    hour = datetime.now(ZoneInfo("Europe/Berlin")).hour
+    if not (POST_HOURS[0] <= hour < POST_HOURS[1]):
+        log.info(f"Сейчас {hour}:00 по Германии — ночью не публикуем, завершение")
+        return
+
     if is_too_early(state):
         remaining = (state["next_post_not_before"] - datetime.now(timezone.utc).timestamp()) / 60
         log.info(f"Ещё не время для следующего поста (~{remaining:.0f} мин), завершение")
@@ -305,35 +353,42 @@ def main():
     candidates = fetch_candidates(state)
     save_state(state)
     log.info(f"Найдено {len(candidates)} новых кандидатов")
+    if not candidates:
+        return
 
-    posted = 0
-    checks = 0
-    for item in candidates:
-        if posted >= MAX_POSTS_PER_RUN or checks >= MAX_CLAUDE_CHECKS_PER_RUN:
-            break
-        checks += 1
-        log.info(f"Обрабатываю: [{item['source']}] {item['title'][:80]}")
+    best, scores = pick_best(candidates)
+    if best is None:
+        return
 
-        body = write_post(item["title"], item["summary"], item["source"])
-        if not body:
-            continue
+    # Слабые новости запоминаем, чтобы не оценивать их повторно
+    for i, sc in scores.items():
+        if sc < 5:
+            mark_seen(state, candidates[i])
+    save_state(state)
 
-        if body.strip().strip("*").strip().upper().startswith("SKIP"):
-            log.info("Не по теме, пропускаю и запоминаю")
-            mark_seen(state, item)
-            save_state(state)
-            continue
+    item = candidates[best]
+    score = scores[best]
+    log.info(f"Лучшая новость ({score}/10): [{item['source']}] {item['title'][:90]}")
+    if score < MIN_SCORE:
+        log.info(f"Нет достаточно резонансных новостей (порог {MIN_SCORE}), жду следующего запуска")
+        return
 
-        if post_to_threads(user_id, fit_limit(body), item["image_url"]):
-            mark_seen(state, item)
-            posted += 1
-            schedule_next_post(state)
-            save_state(state)
-        else:
-            log.error("Не удалось опубликовать, попробую эту новость в следующий раз")
-            break
+    body = write_post(item["title"], item["summary"], item["source"])
+    if not body:
+        return
+    if body.strip().strip("*").strip().upper().startswith("SKIP"):
+        log.info("Новость нельзя подать корректно, пропускаю")
+        mark_seen(state, item)
+        save_state(state)
+        return
 
-    log.info(f"Готово. Опубликовано постов: {posted}")
+    if post_to_threads(user_id, fit_limit(body), item["image_url"]):
+        mark_seen(state, item)
+        schedule_next_post(state)
+        save_state(state)
+        log.info("Готово: пост опубликован")
+    else:
+        log.error("Не удалось опубликовать, попробую в следующий раз")
 
 
 if __name__ == "__main__":
