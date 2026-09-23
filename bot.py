@@ -34,6 +34,7 @@ MIN_INTERVAL_MINUTES = int(os.environ.get("MIN_INTERVAL_MINUTES", "90"))
 MAX_INTERVAL_MINUTES = int(os.environ.get("MAX_INTERVAL_MINUTES", "180"))
 MIN_SCORE = int(os.environ.get("MIN_SCORE", "7"))          # порог «вирусности» 1-10
 POST_HOURS = (7, 23)                                         # публикуем только с 7:00 до 23:00 по Германии
+ENGAGEMENT_HOURS = (18, 22)                                  # раз в день вечером — пост на вовлечение
 MAX_CANDIDATES_TO_SCORE = 40
 STATE_FILE = os.environ.get("STATE_FILE", "state/seen.json")
 
@@ -68,6 +69,8 @@ def load_state() -> dict:
     state.setdefault("seen_hashes", [])
     state.setdefault("seen_links", [])
     state.setdefault("next_post_not_before", None)
+    state.setdefault("last_engagement_date", None)
+    state.setdefault("engagement_history", [])
     return state
 
 
@@ -244,6 +247,79 @@ def write_post(title: str, summary: str, source_name: str):
         return None
 
 
+def write_engagement_post(history: list):
+    """Ежедневный пост без новости: вызывает комментарии и подписки."""
+    recent = "\n".join(f"- {h}" for h in history[-15:]) or "- (пока не было)"
+    weekday = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"][
+        datetime.now(ZoneInfo("Europe/Berlin")).weekday()
+    ]
+    prompt = f"""Ты ведёшь личный аккаунт в Threads: человек, который живёт в Германии и рассказывает
+русскоязычной аудитории о жизни и новостях страны. Сегодня {weekday}, вечер.
+
+Напиши ОДИН пост, цель которого — максимум комментариев и новые подписчики. Выбери один из форматов:
+- острый вопрос о жизни в Германии, на который у каждого есть мнение (бюрократия, деньги, немцы, язык, работа, жильё)
+- «выбери одно»: два варианта, пусть отвечают в комментариях
+- просьба поделиться историей («расскажите, как вы…»)
+- «непопулярное мнение» о жизни в Германии с вопросом, согласны ли люди
+- мини-опрос по итогам недели (если сегодня пятница, суббота или воскресенье)
+
+Правила:
+- первая строка — крючок с одним эмодзи
+- живой разговорный тон, коротко: не длиннее 350 символов
+- в конце — призыв ответить в комментариях и мягкий призыв подписаться
+  (например: «Подписывайтесь, если тоже живёте в Германии — каждый день разбираю главное»)
+- без хэштегов, ссылок, markdown и звёздочек
+- никаких ложных обещаний: без розыгрышей, подарков и «секретов», которых нет
+- не разжигай ненависть к народам, религиям и группам людей
+- тема и формат НЕ должны повторять недавние посты:
+{recent}
+
+Ответь в формате:
+ТЕМА: <3-6 слов о теме>
+ПОСТ:
+<текст поста>"""
+    try:
+        response = anthropic_client.messages.create(
+            model="claude-sonnet-5",
+            max_tokens=500,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = "".join(b.text for b in response.content if hasattr(b, "text")).strip()
+        topic, _, body = raw.partition("ПОСТ:")
+        topic = topic.replace("ТЕМА:", "").strip() or "без темы"
+        body = body.strip() or raw
+        return topic, body
+    except Exception as e:
+        log.error(f"Ошибка при создании поста на вовлечение: {e}")
+        return None, None
+
+
+def maybe_post_engagement(state: dict) -> bool:
+    now = datetime.now(ZoneInfo("Europe/Berlin"))
+    today = now.strftime("%Y-%m-%d")
+    if state.get("last_engagement_date") == today:
+        return False
+    if not (ENGAGEMENT_HOURS[0] <= now.hour < ENGAGEMENT_HOURS[1]):
+        return False
+
+    user_id = threads_me()
+    if not user_id:
+        raise SystemExit("Проверьте секрет THREADS_ACCESS_TOKEN: токен недействителен или истёк")
+
+    topic, body = write_engagement_post(state["engagement_history"])
+    if not body:
+        return False
+    log.info(f"Пост на вовлечение, тема: {topic}")
+    if post_to_threads(user_id, fit_limit(body), None):
+        state["last_engagement_date"] = today
+        state["engagement_history"] = (state["engagement_history"] + [topic])[-30:]
+        schedule_next_post(state)
+        save_state(state)
+        log.info("Готово: пост на вовлечение опубликован")
+        return True
+    return False
+
+
 def fit_limit(text: str) -> str:
     text = text.replace("*", "").strip().strip('"').strip()
     if len(text) <= THREADS_TEXT_LIMIT:
@@ -344,6 +420,9 @@ def main():
     if is_too_early(state):
         remaining = (state["next_post_not_before"] - datetime.now(timezone.utc).timestamp()) / 60
         log.info(f"Ещё не время для следующего поста (~{remaining:.0f} мин), завершение")
+        return
+
+    if maybe_post_engagement(state):
         return
 
     user_id = threads_me()
