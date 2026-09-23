@@ -30,11 +30,11 @@ log = logging.getLogger("germany-threads-bot")
 THREADS_ACCESS_TOKEN = os.environ["THREADS_ACCESS_TOKEN"].strip()
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"].strip()
 
-MIN_INTERVAL_MINUTES = int(os.environ.get("MIN_INTERVAL_MINUTES", "90"))
-MAX_INTERVAL_MINUTES = int(os.environ.get("MAX_INTERVAL_MINUTES", "180"))
-MIN_SCORE = int(os.environ.get("MIN_SCORE", "7"))          # порог «вирусности» 1-10
-POST_HOURS = (7, 23)                                         # публикуем только с 7:00 до 23:00 по Германии
-ENGAGEMENT_HOURS = (18, 22)                                  # раз в день вечером — пост на вовлечение
+NEWS_SLOTS = [8, 12, 15, 21]                                 # 4 новостных поста в день (часы по Германии)
+ENGAGEMENT_HOUR = 19                                         # 1 пост на комментарии/подписку, с 19:00
+MIN_GAP_MINUTES = 45                                         # минимум между любыми двумя постами
+MIN_SCORE = int(os.environ.get("MIN_SCORE", "5"))            # ниже — даже лучшую новость не публикуем
+POST_HOURS = (7, 23)                                         # ночью не публикуем
 MAX_CANDIDATES_TO_SCORE = 40
 STATE_FILE = os.environ.get("STATE_FILE", "state/seen.json")
 
@@ -71,6 +71,9 @@ def load_state() -> dict:
     state.setdefault("next_post_not_before", None)
     state.setdefault("last_engagement_date", None)
     state.setdefault("engagement_history", [])
+    state.setdefault("day", None)
+    state.setdefault("news_done", 0)
+    state.setdefault("last_post_ts", None)
     return state
 
 
@@ -87,15 +90,30 @@ def mark_seen(state: dict, item: dict) -> None:
     state["seen_hashes"].append(item["hash"])
 
 
-def schedule_next_post(state: dict) -> None:
-    delay = random.uniform(MIN_INTERVAL_MINUTES, MAX_INTERVAL_MINUTES)
-    state["next_post_not_before"] = datetime.now(timezone.utc).timestamp() + delay * 60
-    log.info(f"Следующий пост не раньше чем через {delay:.1f} мин")
+def berlin_now() -> datetime:
+    return datetime.now(ZoneInfo("Europe/Berlin"))
 
 
-def is_too_early(state: dict) -> bool:
-    not_before = state.get("next_post_not_before")
-    return bool(not_before) and datetime.now(timezone.utc).timestamp() < not_before
+def slots_due(hour: int) -> int:
+    return sum(1 for h in NEWS_SLOTS if hour >= h)
+
+
+def roll_day(state: dict) -> None:
+    """Новый день — обнуляем счётчик. В первый запуск не догоняем пропущенные слоты."""
+    now = berlin_now()
+    today = now.strftime("%Y-%m-%d")
+    if state.get("day") != today:
+        state["day"] = today
+        state["news_done"] = max(0, slots_due(now.hour) - 1)
+
+
+def recently_posted(state: dict) -> bool:
+    last = state.get("last_post_ts")
+    return bool(last) and datetime.now(timezone.utc).timestamp() - last < MIN_GAP_MINUTES * 60
+
+
+def record_post(state: dict) -> None:
+    state["last_post_ts"] = datetime.now(timezone.utc).timestamp()
 
 
 # ---------------------------------------------------------------------------
@@ -209,18 +227,20 @@ Bürgergeld, пенсии, штрафы, цены, аренда), миграци
 
 
 def write_post(title: str, summary: str, source_name: str):
-    prompt = f"""Ты ведёшь личный аккаунт в Threads: человек, который живёт в Германии,
-рассказывает русскоязычной аудитории самые обсуждаемые новости страны. Задача — чтобы пост
-остановил скролл и под ним начали спорить в комментариях.
+    prompt = f"""Ты ведёшь личный аккаунт в Threads: человек, который живёт в Германии и рассказывает
+русскоязычной аудитории новости страны так, что мимо невозможно пролистать. Задача — вызвать
+сильную эмоцию (возмущение, «да вы издеваетесь», «как так вообще») и спор в комментариях.
 
-Напиши пост на русском:
-- первая строка — сильный крючок с одним эмодзи: самое удивительное, возмутительное или
-  неожиданное в этой новости (без markdown, без звёздочек, без КАПСА целыми словами)
-- затем 1-2 коротких предложения: что произошло и почему это касается людей
-- последняя строка — короткий вопрос к аудитории, на который хочется ответить
-- живой разговорный тон, как пишет человек, а не агентство
+Напиши пост на русском в стиле рейдж-бейта:
+- первая строка — самый возмутительный, абсурдный или несправедливый факт из новости, в лоб,
+  с одним эмодзи (😡 🤯 🤡 💸 🙃 и т. п.); можно риторический вопрос или резкое противопоставление
+  («пока обычные люди…, власти…», «платим мы — решают они»)
+- 1-2 коротких предложения: что именно произошло и кого это бьёт по карману или по нервам
+- последняя строка — поляризующий вопрос, где хочется встать на одну из сторон
+  («Нормально это или уже перебор?», «Вы бы на это согласились?»)
+- дерзкий разговорный тон, как пишет возмущённый живой человек, а не агентство
 - строго не длиннее 450 символов вместе с пробелами
-- без хэштегов, ссылок, названия источника и подписи
+- без хэштегов, ссылок, названия источника, подписи, markdown и КАПСА целыми словами
 
 Жёсткие правила:
 - только факты из новости ниже; не выдумывай детали, цифры и цитаты, не преувеличивай
@@ -299,7 +319,7 @@ def maybe_post_engagement(state: dict) -> bool:
     today = now.strftime("%Y-%m-%d")
     if state.get("last_engagement_date") == today:
         return False
-    if not (ENGAGEMENT_HOURS[0] <= now.hour < ENGAGEMENT_HOURS[1]):
+    if now.hour < ENGAGEMENT_HOUR:
         return False
 
     user_id = threads_me()
@@ -313,7 +333,7 @@ def maybe_post_engagement(state: dict) -> bool:
     if post_to_threads(user_id, fit_limit(body), None):
         state["last_engagement_date"] = today
         state["engagement_history"] = (state["engagement_history"] + [topic])[-30:]
-        schedule_next_post(state)
+        record_post(state)
         save_state(state)
         log.info("Готово: пост на вовлечение опубликован")
         return True
@@ -411,18 +431,25 @@ def post_to_threads(user_id: str, text: str, image_url) -> bool:
 def main():
     log.info("Запуск Germany Threads Bot")
     state = load_state()
+    now = berlin_now()
 
-    hour = datetime.now(ZoneInfo("Europe/Berlin")).hour
-    if not (POST_HOURS[0] <= hour < POST_HOURS[1]):
-        log.info(f"Сейчас {hour}:00 по Германии — ночью не публикуем, завершение")
+    if not (POST_HOURS[0] <= now.hour < POST_HOURS[1]):
+        log.info(f"Сейчас {now.hour}:00 по Германии — ночью не публикуем")
         return
 
-    if is_too_early(state):
-        remaining = (state["next_post_not_before"] - datetime.now(timezone.utc).timestamp()) / 60
-        log.info(f"Ещё не время для следующего поста (~{remaining:.0f} мин), завершение")
+    roll_day(state)
+    save_state(state)
+
+    if recently_posted(state):
+        log.info(f"Последний пост был меньше {MIN_GAP_MINUTES} мин назад, жду")
         return
 
     if maybe_post_engagement(state):
+        return
+
+    due = slots_due(now.hour)
+    if state["news_done"] >= due:
+        log.info(f"Новостных постов сегодня {state['news_done']}/{len(NEWS_SLOTS)}, следующий слот позже")
         return
 
     user_id = threads_me()
@@ -449,7 +476,7 @@ def main():
     score = scores[best]
     log.info(f"Лучшая новость ({score}/10): [{item['source']}] {item['title'][:90]}")
     if score < MIN_SCORE:
-        log.info(f"Нет достаточно резонансных новостей (порог {MIN_SCORE}), жду следующего запуска")
+        log.info(f"Нет достаточно резонансных новостей (порог {MIN_SCORE}), попробую через час")
         return
 
     body = write_post(item["title"], item["summary"], item["source"])
@@ -463,9 +490,10 @@ def main():
 
     if post_to_threads(user_id, fit_limit(body), item["image_url"]):
         mark_seen(state, item)
-        schedule_next_post(state)
+        state["news_done"] += 1
+        record_post(state)
         save_state(state)
-        log.info("Готово: пост опубликован")
+        log.info(f"Готово: новостной пост {state['news_done']}/{len(NEWS_SLOTS)} за сегодня")
     else:
         log.error("Не удалось опубликовать, попробую в следующий раз")
 
