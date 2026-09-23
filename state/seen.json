@@ -8,9 +8,11 @@
     "https://www.tagesschau.de/inland/kassenbon-digital-104.html"
   ],
   "next_post_not_before": 1790180198.0212734,
-  "last_engagement_date": null,
-  "engagement_history": [],
+  "last_engagement_date": "2026-09-23",
+  "engagement_history": [
+    "наличные или карта в Германии"
+  ],
   "day": "2026-09-23",
   "news_done": 2,
-  "last_post_ts": null
+  "last_post_ts": 1790187963.066402
 }
